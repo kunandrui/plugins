@@ -8,9 +8,17 @@ import (
 	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
-	"github.com/gophercloud/gophercloud"
 	"runtime"
 )
+
+type OSAuthOptions struct {
+	IdentityEndpoint string `json:"identity_endpoint"`
+	Username         string `json:"username"`
+	Password         string `json:"password"`
+	DomainID         string `json:"domain_id"`
+	ProjectID        string `json:"project_id"`
+	ProjectName      string `json:"project_name"`
+}
 
 type PluginConf struct {
 	// This embeds the standard NetConf structure which allows your plugin
@@ -18,9 +26,7 @@ type PluginConf struct {
 	// and PrevResult.
 	types.NetConf
 
-	OSAuthOptions struct {
-		gophercloud.AuthOptions
-	} `json:"OSAuthOptions,omitempty"`
+	OSAuthOptions OSAuthOptions `json:"os_auth_options"`
 }
 
 func init() {
