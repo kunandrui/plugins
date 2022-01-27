@@ -359,16 +359,18 @@ func cmdAdd(args *skel.CmdArgs) error {
 		'external-ids:vm-uuid=%s' % instance_id]
 	*/
 
-	ovsArgs := []string{"--", "--if-exists", "del-port", qvoName, "--",
-		"add-port", "br-int", qvoName,
-		"--", "set", "Interface", qvoName,
-		fmt.Sprintf("external-ids:iface-id=%s", portID),
-		fmt.Sprintf("external-ids:iface-status=%s", "active"),
-		fmt.Sprintf("external-ids:attached-mac=%s", mac),
-		fmt.Sprintf("external-ids:vm-uuid=%s", vmID),
-	}
+	/*
+		ovsArgs := []string{"--", "--if-exists", "del-port", qvoName, "--",
+			"add-port", "br-int", qvoName,
+			"--", "set", "Interface", qvoName,
+			fmt.Sprintf("external-ids:iface-id=%s", portID),
+			fmt.Sprintf("external-ids:iface-status=%s", "active"),
+			fmt.Sprintf("external-ids:attached-mac=%s", mac),
+			fmt.Sprintf("external-ids:vm-uuid=%s", vmID),
+		}
 
-	output, err := exec.Command(OvsVsCtl, ovsArgs...).CombinedOutput()
+		output, err := exec.Command(OvsVsCtl, ovsArgs...).CombinedOutput()
+	*/
 
 	result := &current.Result{
 		CNIVersion: conf.CNIVersion,
