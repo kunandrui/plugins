@@ -11,15 +11,11 @@ import (
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ns"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
-	"github.com/containernetworking/plugins/pkg/utils/sysctl"
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/ports"
-	"github.com/vishvananda/netns"
+
 	"net"
-	"os/exec"
-	"strings"
-	"time"
 
 	"github.com/vishvananda/netlink"
 	"runtime"
