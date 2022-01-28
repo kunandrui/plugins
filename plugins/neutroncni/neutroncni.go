@@ -344,8 +344,8 @@ func cmdAdd(args *skel.CmdArgs) error {
 	containerIfName := args.IfName
 	hostIf, containerIf, err := makeVethPair(hostIfName, containerIfName, 1450, port.MACAddress)
 
-	if err = netlink.LinkSetNsFd(containerIf, int(netns.Fd())); err != nil {
-		return fmt.Errorf("failed to link netns: %v", err)
+	if err := netlink.SetPromiscOn(hostIf); err != nil {
+		return fmt.Errorf("faild to set %q promisc on: %v", qvoName, err)
 	}
 
 	if err = netlink.LinkSetUp(hostIf); err != nil {
@@ -354,6 +354,10 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	if err = netlink.LinkSetTxQLen(hostIf, 1000); err != nil {
 		return fmt.Errorf("can not set host nic %s qlen: %v", hostIfName, err)
+	}
+
+	if err = netlink.LinkSetNsFd(containerIf, int(netns.Fd())); err != nil {
+		return fmt.Errorf("failed to link netns: %v", err)
 	}
 
 	// create qbr
@@ -397,6 +401,10 @@ func cmdAdd(args *skel.CmdArgs) error {
 	// set up
 	if err = netlink.LinkSetUp(qvbVeth); err != nil {
 		return fmt.Errorf("can not set host nic %s up: %v", qvbName, err)
+	}
+
+	if err = netlink.LinkSetUp(qvoVeth); err != nil {
+		return fmt.Errorf("can not set host nic %s up: %v", qvoName, err)
 	}
 
 	if err = netlink.LinkSetTxQLen(qvbVeth, 1000); err != nil {
