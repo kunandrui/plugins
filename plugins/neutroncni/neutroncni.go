@@ -14,6 +14,7 @@ import (
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/ports"
+	"os/exec"
 
 	"net"
 
@@ -30,8 +31,7 @@ type OSAuthOptions struct {
 	IdentityEndpoint string `json:"identity_endpoint"`
 	Username         string `json:"username"`
 	Password         string `json:"password"`
-	DomainID         string `json:"domain_id"`
-	ProjectID        string `json:"project_id"`
+	DomainName       string `json:"domain_name"`
 	ProjectName      string `json:"project_name"`
 }
 
@@ -86,13 +86,16 @@ func (opts UpdateOpts) ToPortUpdateMap() (map[string]interface{}, error) {
 }
 
 func CreateProvider(conf *PluginConf) (*gophercloud.ProviderClient, error) {
+
 	authOpts := gophercloud.AuthOptions{
 		IdentityEndpoint: conf.OSAuthOptions.IdentityEndpoint,
 		Username:         conf.OSAuthOptions.Username,
 		Password:         conf.OSAuthOptions.Password,
-		DomainID:         conf.OSAuthOptions.DomainID,
-		TenantID:         conf.OSAuthOptions.ProjectID,
-		TenantName:       conf.OSAuthOptions.ProjectName,
+		DomainName:       conf.OSAuthOptions.DomainName,
+		Scope: &gophercloud.AuthScope{
+			ProjectName: conf.OSAuthOptions.ProjectName,
+			DomainName:  conf.OSAuthOptions.DomainName,
+		},
 	}
 
 	provider, err := openstack.AuthenticatedClient(authOpts)
@@ -144,6 +147,73 @@ func UpdateNeutronPort(client *gophercloud.ServiceClient, portID string) (*ports
 	return port, nil
 }
 
+func setupVethPair(portID, ifName, mac string, mtu int) (string, string, error) {
+	var err error
+	hostNicName, containerNicName := generateNicName(portID, ifName)
+
+	veth := netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: hostNicName}, PeerName: containerNicName}
+	if mtu > 0 {
+		veth.MTU = mtu
+	}
+	if mac != "" {
+		m, err := net.ParseMAC(mac)
+		if err != nil {
+			return "", "", err
+		}
+		veth.LinkAttrs.HardwareAddr = m
+	}
+	if err = netlink.LinkAdd(&veth); err != nil {
+		if err := netlink.LinkDel(&veth); err != nil {
+			return "", "", err
+		}
+		return "", "", fmt.Errorf("failed to crate veth for %v", err)
+	}
+	return hostNicName, containerNicName, nil
+}
+
+func generateNicName(portID, ifname string) (string, string) {
+	if ifname == "eth0" {
+		return fmt.Sprintf("veth%s_h", portID[0:11]), fmt.Sprintf("veth%s_c", portID[0:11])
+	}
+	return fmt.Sprintf("%s_%s_h", portID[0:11-len(ifname)], ifname), fmt.Sprintf("%s_%s_c", portID[0:11-len(ifname)], ifname)
+}
+
+func configureHostNic(nicName string) error {
+	hostLink, err := netlink.LinkByName(nicName)
+	if err != nil {
+		return fmt.Errorf("can not find host nic %s: %v", nicName, err)
+	}
+
+	if hostLink.Attrs().OperState != netlink.OperUp {
+		if err = netlink.LinkSetUp(hostLink); err != nil {
+			return fmt.Errorf("can not set host nic %s up: %v", nicName, err)
+		}
+	}
+	if err = netlink.LinkSetTxQLen(hostLink, 1000); err != nil {
+		return fmt.Errorf("can not set host nic %s qlen: %v", nicName, err)
+	}
+
+	return nil
+}
+
+func configureContainerNic(nicName, ifName, netns ns.NetNS) error {
+	containerLink, err := netlink.LinkByName(nicName)
+	if err != nil {
+		return fmt.Errorf("can not find container nic %s: %v", nicName, err)
+	}
+
+	// Set link alias to its origin link name for fastpath to recognize and bypass netfilter
+	if err := netlink.LinkSetAlias(containerLink, nicName); err != nil {
+		return err
+	}
+
+	if err = netlink.LinkSetNsFd(containerLink, int(netns.Fd())); err != nil {
+		return fmt.Errorf("failed to link netns: %v", err)
+	}
+
+	return nil
+}
+
 func makeVethPair(name, peer string, mtu int, mac string) (netlink.Link, netlink.Link, error) {
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
@@ -184,36 +254,6 @@ func makeVethPair(name, peer string, mtu int, mac string) (netlink.Link, netlink
 	}
 
 	return veth1, veth2, nil
-}
-
-func setupVeth(netns ns.NetNS, ifName, hostIfName string, mtu int, mac string) (*current.Interface, *current.Interface, error) {
-	contIface := &current.Interface{}
-	hostIface := &current.Interface{}
-
-	err := netns.Do(func(hostNS ns.NetNS) error {
-		// create the veth pair in the container and move host end into host netns
-		hostVeth, containerVeth, err := ip.SetupVethWithName(ifName, hostIfName, mtu, mac, hostNS)
-		if err != nil {
-			return err
-		}
-		contIface.Name = containerVeth.Name
-		contIface.Mac = containerVeth.HardwareAddr.String()
-		contIface.Sandbox = netns.Path()
-		hostIface.Name = hostVeth.Name
-		return nil
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// need to lookup hostVeth again as its index has changed during ns move
-	hostVeth, err := netlink.LinkByName(hostIface.Name)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to lookup %q: %v", hostIface.Name, err)
-	}
-	hostIface.Mac = hostVeth.Attrs().HardwareAddr.String()
-
-	return hostIface, contIface, nil
 }
 
 func bridgeByName(name string) (*netlink.Bridge, error) {
@@ -303,11 +343,15 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	// get mac
 	// TODO
-	hostIfName := fmt.Sprintf("veth%s", portPrefix)
-	mac := port.MACAddress
-	vmID := args.ContainerID
+	hostIfName, containerIfName, err := setupVethPair(portID, args.IfName, port.MACAddress, 1450)
 
-	hostIface, _, err := setupVeth(netns, args.IfName, hostIfName, 1450, mac)
+	if err = configureHostNic(hostIfName); err != nil {
+		return fmt.Errorf("failed to configure %s: %v", hostIfName, err)
+	}
+
+	if err = configureContainerNic(containerIfName, args.IfName, netns); err != nil {
+		return fmt.Errorf("failed to configure %s: %v", containerIfName, err)
+	}
 
 	// create qbr
 	qbrName := fmt.Sprintf("qbr%s", portPrefix)
@@ -317,9 +361,9 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	// need to lookup hostVeth again as its index has changed during ns move
-	hostVeth, err := netlink.LinkByName(hostIface.Name)
+	hostVeth, err := netlink.LinkByName(hostIfName)
 	if err != nil {
-		return fmt.Errorf("failed to lookup %q: %v", hostIface.Name, err)
+		return fmt.Errorf("failed to lookup %q: %v", hostIfName, err)
 	}
 	//hostIface.Mac = hostVeth.Attrs().HardwareAddr.String()
 
@@ -333,14 +377,19 @@ func cmdAdd(args *skel.CmdArgs) error {
 	qvoName := fmt.Sprintf("qvo%s", portPrefix)
 	qvbVeth, qvoVeth, err := makeVethPair(qvbName, qvoName, 1450, "")
 
+	// set qvo promisc on
+	if err := netlink.SetPromiscOn(qvbVeth); err != nil {
+		return fmt.Errorf("faild to set %q promisc on: %v", qvbName, err)
+	}
+
 	// connect qvb veth end to the bridge
 	if err := netlink.LinkSetMaster(qvbVeth, qbr); err != nil {
-		return fmt.Errorf("failed to connect %s to bridge %s: %v", qvbVeth.Attrs().Name, qbr.Attrs().Name, err)
+		return fmt.Errorf("failed to connect %s to bridge %s: %v", qvbName, qbrName, err)
 	}
 
 	// set qvo promisc on
 	if err := netlink.SetPromiscOn(qvoVeth); err != nil {
-		return fmt.Errorf("faild to set %q promisc on: %v", qvoVeth.Attrs().Name, err)
+		return fmt.Errorf("faild to set %q promisc on: %v", qvoName, err)
 	}
 
 	// connect qvo veth end to ovs
@@ -355,25 +404,30 @@ func cmdAdd(args *skel.CmdArgs) error {
 		'external-ids:vm-uuid=%s' % instance_id]
 	*/
 
-	/*
-		ovsArgs := []string{"--", "--if-exists", "del-port", qvoName, "--",
-			"add-port", "br-int", qvoName,
-			"--", "set", "Interface", qvoName,
-			fmt.Sprintf("external-ids:iface-id=%s", portID),
-			fmt.Sprintf("external-ids:iface-status=%s", "active"),
-			fmt.Sprintf("external-ids:attached-mac=%s", mac),
-			fmt.Sprintf("external-ids:vm-uuid=%s", vmID),
-		}
-
-		output, err := exec.Command(OvsVsCtl, ovsArgs...).CombinedOutput()
-	*/
-
-	result := &current.Result{
-		CNIVersion: conf.CNIVersion,
+	mac := port.MACAddress
+	vmID := args.ContainerID
+	ovsArgs := []string{"--", "--if-exists", "del-port", qvoName, "--",
+		"add-port", "br-int", qvoName,
+		"--", "set", "Interface", qvoName,
+		fmt.Sprintf("external-ids:iface-id=%s", portID),
+		fmt.Sprintf("external-ids:iface-status=%s", "active"),
+		fmt.Sprintf("external-ids:attached-mac=%s", mac),
+		fmt.Sprintf("external-ids:vm-uuid=%s", vmID),
 	}
 
+	output, err := exec.Command(OvsVsCtl, ovsArgs...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ovs add port failed %q: %v", output, err)
+	}
+
+	/*
+		result := &current.Result{
+			CNIVersion: conf.CNIVersion,
+		}
+	*/
+	fmt.Println("cmd add success!")
 	// Pass through the result for the next plugin
-	return types.PrintResult(result, conf.CNIVersion)
+	return nil
 }
 
 // cmdDel is called for DELETE requests
@@ -384,16 +438,23 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 	_ = conf
 
-	// Do your delete here
-	// ovs delete port
-	// output, err := ovs.Exec(ovs.IfExists, "--with-iface", "del-port", "br-int", nicName)
-
 	portID := "ccf9148b-2b73-46c1-b80d-fb7d7f79209d"
 	portPrefix := portID[0:11]
 	// delete qvo, qvb
 	qvoName := fmt.Sprintf("qvo%s", portPrefix)
 	//qvbName := fmt.Sprintf("qvb%s", portPrefix)
 
+	// Do your delete here
+	// ovs delete port
+
+	// output, err := ovs.Exec(ovs.IfExists, "--with-iface", "del-port", "br-int", nicName)
+	ovsArgs := []string{"--if-exists", "--with-iface", "del-port", "br-int", qvoName}
+	output, err := exec.Command(OvsVsCtl, ovsArgs...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ovs del port failed %q: %v", output, err)
+	}
+
+	// delete qvo,qvb
 	qvoVeth, err := netlink.LinkByName(qvoName)
 	if err != nil {
 		// If link already not exists, return quietly
@@ -433,7 +494,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	if err = netlink.LinkDel(hostIfaceLink); err != nil {
 		return fmt.Errorf("delete qbr bridge link %s failed %v", hostIfaceName, err)
 	}
-
+	fmt.Println("cmd del success!")
 	return nil
 }
 
