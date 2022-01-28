@@ -129,11 +129,14 @@ func GetNeutronPort(client *gophercloud.ServiceClient, portID string) (*ports.Po
 	return port, nil
 }
 
-func UpdateNeutronPort(client *gophercloud.ServiceClient, portID string) (*ports.Port, error) {
+func UpdateNeutronPort(client *gophercloud.ServiceClient, portID string, containerID string) (*ports.Port, error) {
 	//TODO
 	host := "cc-zyktest-x86-controller-2"
+	deviceOwner := "compute:nava"
 	opts := UpdateOpts{
-		BindHost: &host,
+		DeviceID:    &containerID,
+		DeviceOwner: &deviceOwner,
+		BindHost:    &host,
 	}
 	port, err := ports.Update(client, portID, opts).Extract()
 	if err != nil {
@@ -235,13 +238,17 @@ func makeVethPair(name, peer string, mtu int, mac string) (netlink.Link, netlink
 		return nil, nil, err
 	}
 
-	if err = netlink.LinkSetUp(veth1); err != nil {
-		return nil, nil, fmt.Errorf("failed to set %v up: %v", veth1, err)
-	}
+	/*
+		if err = netlink.LinkSetUp(veth1); err != nil {
+			return nil, nil, fmt.Errorf("failed to set %v up: %v", veth1, err)
+		}
+	*/
 
-	if err = netlink.LinkSetUp(veth2); err != nil {
-		return nil, nil, fmt.Errorf("failed to set %v up: %v", veth2, err)
-	}
+	/*
+		if err = netlink.LinkSetUp(veth2); err != nil {
+			return nil, nil, fmt.Errorf("failed to set %v up: %v", veth2, err)
+		}
+	*/
 
 	return veth1, veth2, nil
 }
@@ -319,7 +326,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("failed to create neutron client: %v", err)
 	}
 
-	port, err := UpdateNeutronPort(neutronClient, portID)
+	port, err := UpdateNeutronPort(neutronClient, portID, args.ContainerID)
 	if err != nil {
 		return fmt.Errorf("failed to update port %s: %v", portID, err)
 	}
@@ -335,10 +342,19 @@ func cmdAdd(args *skel.CmdArgs) error {
 	// TODO
 	hostIfName := fmt.Sprintf("veth%s", portPrefix)
 	containerIfName := args.IfName
-	_, containerIf, err := makeVethPair(hostIfName, containerIfName, 1450, port.MACAddress)
+	hostIf, containerIf, err := makeVethPair(hostIfName, containerIfName, 1450, port.MACAddress)
 
 	if err = netlink.LinkSetNsFd(containerIf, int(netns.Fd())); err != nil {
 		return fmt.Errorf("failed to link netns: %v", err)
+	}
+
+	if hostIf.Attrs().OperState != netlink.OperUp {
+		if err = netlink.LinkSetUp(hostIf); err != nil {
+			return fmt.Errorf("can not set host nic %s up: %v", hostIfName, err)
+		}
+	}
+	if err = netlink.LinkSetTxQLen(hostIf, 1000); err != nil {
+		return fmt.Errorf("can not set host nic %s qlen: %v", hostIfName, err)
 	}
 
 	// create qbr
@@ -378,6 +394,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 	// set qvo promisc on
 	if err := netlink.SetPromiscOn(qvoVeth); err != nil {
 		return fmt.Errorf("faild to set %q promisc on: %v", qvoName, err)
+	}
+
+	// set up
+	if qvbVeth.Attrs().OperState != netlink.OperUp {
+		if err = netlink.LinkSetUp(qvbVeth); err != nil {
+			return fmt.Errorf("can not set host nic %s up: %v", qvbName, err)
+		}
 	}
 
 	// connect qvo veth end to ovs
