@@ -220,7 +220,7 @@ func makeVethPair(name, peer string, mtu int, mac string) (netlink.Link, netlink
 		if err != nil {
 			return nil, nil, err
 		}
-		veth.LinkAttrs.HardwareAddr = m
+		veth.PeerHardwareAddr = m
 	}
 	if err := netlink.LinkAdd(veth); err != nil {
 		return nil, nil, err
@@ -348,11 +348,10 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("failed to link netns: %v", err)
 	}
 
-	if hostIf.Attrs().OperState != netlink.OperUp {
-		if err = netlink.LinkSetUp(hostIf); err != nil {
-			return fmt.Errorf("can not set host nic %s up: %v", hostIfName, err)
-		}
+	if err = netlink.LinkSetUp(hostIf); err != nil {
+		return fmt.Errorf("can not set host nic %s up: %v", hostIfName, err)
 	}
+
 	if err = netlink.LinkSetTxQLen(hostIf, 1000); err != nil {
 		return fmt.Errorf("can not set host nic %s qlen: %v", hostIfName, err)
 	}
@@ -369,7 +368,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if err != nil {
 		return fmt.Errorf("failed to lookup %q: %v", hostIfName, err)
 	}
-	//hostIface.Mac = hostVeth.Attrs().HardwareAddr.String()
 
 	// connect host veth end to the bridge
 	if err := netlink.LinkSetMaster(hostVeth, qbr); err != nil {
@@ -397,12 +395,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	// set up
-	if qvbVeth.Attrs().OperState != netlink.OperUp {
-		if err = netlink.LinkSetUp(qvbVeth); err != nil {
-			return fmt.Errorf("can not set host nic %s up: %v", qvbName, err)
-		}
+	if err = netlink.LinkSetUp(qvbVeth); err != nil {
+		return fmt.Errorf("can not set host nic %s up: %v", qvbName, err)
 	}
 
+	if err = netlink.LinkSetTxQLen(qvbVeth, 1000); err != nil {
+		return fmt.Errorf("can not set host nic %s qlen: %v", qvbName, err)
+	}
 	// connect qvo veth end to ovs
 
 	/*
