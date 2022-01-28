@@ -148,7 +148,7 @@ func UpdateNeutronPort(client *gophercloud.ServiceClient, portID string) (*ports
 
 func setupVethPair(portID, ifName, mac string, mtu int) (string, string, error) {
 	var err error
-	hostNicName, containerNicName := generateNicName(portID, ifName)
+	hostNicName, containerNicName := fmt.Sprintf("veth%s", portID[0:11]), ifName
 
 	veth := netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: hostNicName}, PeerName: containerNicName}
 	if mtu > 0 {
@@ -168,13 +168,6 @@ func setupVethPair(portID, ifName, mac string, mtu int) (string, string, error) 
 		return "", "", fmt.Errorf("failed to crate veth for %v", err)
 	}
 	return hostNicName, containerNicName, nil
-}
-
-func generateNicName(portID, ifname string) (string, string) {
-	if ifname == "eth0" {
-		return fmt.Sprintf("veth%s_h", portID[0:11]), fmt.Sprintf("veth%s_c", portID[0:11])
-	}
-	return fmt.Sprintf("%s_%s_h", portID[0:11-len(ifname)], ifname), fmt.Sprintf("%s_%s_c", portID[0:11-len(ifname)], ifname)
 }
 
 func configureHostNic(nicName string) error {
