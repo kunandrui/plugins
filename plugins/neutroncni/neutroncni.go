@@ -63,8 +63,6 @@ func parseConfig(stdin []byte) (*PluginConf, error) {
 		return nil, fmt.Errorf("failed to parse network configuration: %v", err)
 	}
 
-	fmt.Println(conf.OSAuthOptions)
-
 	return &conf, nil
 }
 
@@ -335,14 +333,12 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	// get mac
 	// TODO
-	hostIfName, containerIfName, err := setupVethPair(portID, args.IfName, port.MACAddress, 1450)
+	hostIfName := fmt.Sprintf("veth%s", portPrefix)
+	containerIfName := args.IfName
+	_, containerIf, err := makeVethPair(hostIfName, containerIfName, 1450, port.MACAddress)
 
-	if err = configureHostNic(hostIfName); err != nil {
-		return fmt.Errorf("failed to configure %s: %v", hostIfName, err)
-	}
-
-	if err = configureContainerNic(containerIfName, args.IfName, netns); err != nil {
-		return fmt.Errorf("failed to configure %s: %v", containerIfName, err)
+	if err = netlink.LinkSetNsFd(containerIf, int(netns.Fd())); err != nil {
+		return fmt.Errorf("failed to link netns: %v", err)
 	}
 
 	// create qbr
