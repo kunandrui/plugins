@@ -52,7 +52,6 @@ func init() {
 func main() {
 	// replace TODO with your plugin name
 	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.All, bv.BuildString("neutronCNI"))
-
 }
 
 // parseConfig parses the supplied configuration (and prevResult) from stdin.
