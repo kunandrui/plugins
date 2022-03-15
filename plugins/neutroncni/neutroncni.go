@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
+	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
 	"github.com/containernetworking/plugins/pkg/ns"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/ports"
+	"github.com/gophercloud/gophercloud/openstack/networking/v2/subnets"
 	"os/exec"
+	"strings"
 
 	"net"
 
@@ -146,7 +149,7 @@ func UpdateNeutronPort(client *gophercloud.ServiceClient, portID string, contain
 	return port, nil
 }
 
-func setUpContVethPair(hostIfName, contIfName string, mtu int, mac string, netns ns.NetNS) (netlink.Link, netlink.Link, error) {
+func setUpContVethPair(hostIfName, contIfName string, mtu int, mac string, netns ns.NetNS, port *ports.Port, subnet *subnets.Subnet) (netlink.Link, netlink.Link, error) {
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
 			Name: hostIfName,
@@ -178,20 +181,20 @@ func setUpContVethPair(hostIfName, contIfName string, mtu int, mac string, netns
 		return nil, nil, err
 	}
 
-	if err := netlink.SetPromiscOn(hostIf); err != nil {
+	if err = netlink.SetPromiscOn(hostIf); err != nil {
 		return nil, nil, fmt.Errorf("faild to set %q promisc on: %v", hostIfName, err)
 	}
 
-	if err := netlink.LinkSetUp(hostIf); err != nil {
+	if err = netlink.LinkSetUp(hostIf); err != nil {
 		return nil, nil, fmt.Errorf("can not set host nic %s up: %v", hostIfName, err)
 	}
 
-	if err := netlink.LinkSetTxQLen(hostIf, 1000); err != nil {
+	if err = netlink.LinkSetTxQLen(hostIf, 1000); err != nil {
 		return nil, nil, fmt.Errorf("can not set host nic %s qlen: %v", hostIfName, err)
 	}
 
 	// configure container nic
-	if err := netlink.LinkSetNsFd(contIf, int(netns.Fd())); err != nil {
+	if err = netlink.LinkSetNsFd(contIf, int(netns.Fd())); err != nil {
 		return nil, nil, fmt.Errorf("failed to link netns: %v", err)
 	}
 
@@ -202,8 +205,22 @@ func setUpContVethPair(hostIfName, contIfName string, mtu int, mac string, netns
 			return err
 		}
 		// configure ip
+		ip := port.FixedIPs[0].IPAddress
+		cidr := subnet.CIDR
+		ipStr := fmt.Sprintf("%s/%s", ip, strings.Split(cidr, "/")[1])
 
-		// configure gateway
+		ipAddr, err := netlink.ParseAddr(ipStr)
+		if err != nil {
+			return fmt.Errorf("can not parse address %s: %v", ipStr, err)
+		}
+
+		if err = netlink.AddrAdd(contIf, ipAddr); err != nil {
+			return fmt.Errorf("can not add address %v to nic %s: %v", ipAddr, contIf, err)
+		}
+
+		if err != nil {
+			return fmt.Errorf("failed to configure gateway: %v", err)
+		}
 		if err := netlink.LinkSetUp(contIf); err != nil {
 			return fmt.Errorf("can not set container nic %s up: %v", contIfName, err)
 		}
@@ -323,7 +340,6 @@ func setUpBridge(brName string, mtu int, promiscMode, vlanFiltering bool) (*netl
 	if err := netlink.LinkSetUp(br); err != nil {
 		return nil, err
 	}
-
 	return br, nil
 }
 
@@ -336,6 +352,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	// TODO
 	portID := "ccf9148b-2b73-46c1-b80d-fb7d7f79209d"
+	subnetID := "5670bbfe-4798-44b2-9fa8-5342db96a3c0"
 	portPrefix := portID[0:11]
 	// update port
 	provider, err := CreateProvider(conf)
@@ -352,6 +369,10 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("failed to update port %s: %v", portID, err)
 	}
 
+	subnet, err := subnets.Get(neutronClient, subnetID).Extract()
+	if err != nil {
+		return fmt.Errorf("failed to get subnet %s: %v", subnetID, err)
+	}
 	// create veth
 	netns, err := ns.GetNS(args.Netns)
 	if err != nil {
@@ -361,14 +382,32 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	// get mac
 	// TODO
-	hostIfName := fmt.Sprintf("veth%s", portPrefix)
+	hostIfName := fmt.Sprintf("tap%s", portPrefix)
 	containerIfName := args.IfName
 
-	hostIf, _, err := setUpContVethPair(hostIfName, containerIfName, 1450, port.MACAddress, netns)
-
+	hostIf, _, err := setUpContVethPair(hostIfName, containerIfName, 1450, port.MACAddress, netns, port, subnet)
+	defer func() {
+		if err != nil {
+			hostIf, _ := netlink.LinkByName(hostIfName)
+			if hostIf != nil {
+				netlink.LinkDel(hostIf)
+			}
+		}
+	}()
+	if err != nil {
+		return fmt.Errorf("failed to set up container veth: %v", err)
+	}
 	// create qbr
 	qbrName := fmt.Sprintf("qbr%s", portPrefix)
 	qbr, err := setUpBridge(qbrName, 1450, true, false)
+	defer func() {
+		if err != nil {
+			qbr, _ := netlink.LinkByName(qbrName)
+			if qbr != nil {
+				netlink.LinkDel(qbr)
+			}
+		}
+	}()
 	if err != nil {
 		return fmt.Errorf("failed to set up bridge %s: %v", qbr.Name, err)
 	}
@@ -382,10 +421,24 @@ func cmdAdd(args *skel.CmdArgs) error {
 	qvbName := fmt.Sprintf("qvb%s", portPrefix)
 	qvoName := fmt.Sprintf("qvo%s", portPrefix)
 
-	_, _, err = setUpVethPair(qvbName, qvoName, 1450, 1000)
+	qvb, _, err := setUpVethPair(qvbName, qvoName, 1450, 1000)
+	defer func() {
+		if err != nil {
+			qvb, _ := netlink.LinkByName(qvbName)
+			if qvb != nil {
+				netlink.LinkDel(qvb)
+			}
+		}
+	}()
 	if err != nil {
 		return fmt.Errorf("failed set up qvb qvo: %v", err)
 	}
+
+	// connect qvb veth to the bridge
+	if err := netlink.LinkSetMaster(qvb, qbr); err != nil {
+		return fmt.Errorf("failed to connect %s to bridge %s: %v", qvbName, qbrName, err)
+	}
+
 	// connect qvo veth end to ovs
 	/*
 		['--', '--if-exists', 'del-port', dev, '--',
@@ -412,14 +465,41 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("ovs add port failed %q: %v", output, err)
 	}
 
+	// TODO
+	// configure gateway
 	/*
-		result := &current.Result{
-			CNIVersion: conf.CNIVersion,
-		}
+		gateway := "192.168.11.4"
+		// configure gateway
+		_, defaultNet, _ := net.ParseCIDR("0.0.0.0/0")
+		err = netlink.RouteReplace(&netlink.Route{
+			LinkIndex: contIf.Attrs().Index,
+			Scope:     netlink.SCOPE_UNIVERSE,
+			Dst:       defaultNet,
+			Gw:        net.ParseIP(gateway),
+		})
 	*/
-	fmt.Println("cmd add success!")
+
+	result := current.Result{CNIVersion: conf.CNIVersion}
+	podIface := current.Interface{
+		Name: containerIfName,
+		Mac:  mac,
+	}
+	portIP := port.FixedIPs[0]
+	gateway := subnet.GatewayIP
+	_, mask, _ := net.ParseCIDR(subnet.CIDR)
+	ip := current.IPConfig{
+		Address: net.IPNet{IP: net.ParseIP(portIP.IPAddress), Mask: mask.Mask},
+		Gateway: net.ParseIP(gateway).To4(),
+	}
+	route := types.Route{
+		Dst: net.IPNet{IP: net.ParseIP("0.0.0.0").To4(), Mask: net.CIDRMask(0, 32)},
+		GW:  net.ParseIP(gateway).To4(),
+	}
+	result.IPs = []*current.IPConfig{&ip}
+	result.Routes = []*types.Route{&route}
+	result.Interfaces = []*current.Interface{&podIface}
 	// Pass through the result for the next plugin
-	return nil
+	return types.PrintResult(&result, conf.CNIVersion)
 }
 
 // cmdDel is called for DELETE requests
@@ -474,7 +554,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 
 	// delete contIface
-	hostIfName := fmt.Sprintf("veth%s", portPrefix)
+	hostIfName := fmt.Sprintf("tap%s", portPrefix)
 	hostIfLink, err := netlink.LinkByName(hostIfName)
 	if err != nil {
 		// If link already not exists, return quietly
